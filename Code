@@ -1,0 +1,222 @@
+"""
+Created on Tue Jan 14 12:52:05 2025
+
+@author: NIKA
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SqueezeExcite3D(nn.Module):
+    """
+    3D Squeeze-and-Excitation (Channel Attention) Module
+    """
+    def __init__(self, in_channels, reduction=16):
+        super(SqueezeExcite3D, self).__init__()
+        self.in_channels = in_channels
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(in_channels, in_channels // reduction, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(in_channels // reduction, in_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        scale = self.se(x)
+        return x * scale
+
+
+class ResidualBlock3D(nn.Module):
+    """
+    A basic 3D residual block with skip connections
+    """
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResidualBlock3D, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3,
+                               stride=stride, padding=1)
+        self.bn1   = nn.BatchNorm3d(out_channels)
+        self.relu  = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3,
+                               stride=1, padding=1)
+        self.bn2   = nn.BatchNorm3d(out_channels)
+
+        # If we need to match the dimensions for skip connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm3d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        # Skip connection
+        identity = self.shortcut(identity)
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class MultiScaleBlock3D(nn.Module):
+    """
+    Parallel convolutions with different kernel sizes
+    """
+    def __init__(self, in_channels, out_channels, kernel_sizes=[3, 5]):
+        super(MultiScaleBlock3D, self).__init__()
+
+        # We'll reduce channels then apply varying kernel sizes
+        mid_channels = out_channels // 2
+
+        # Path A (3x3x3)
+        self.pathA = nn.Sequential(
+            nn.Conv3d(in_channels, mid_channels, kernel_size=1, stride=1),
+            nn.BatchNorm3d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid_channels, mid_channels, kernel_size=kernel_sizes[0],
+                      stride=1, padding=kernel_sizes[0]//2),
+            nn.BatchNorm3d(mid_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Path B (5x5x5)
+        self.pathB = nn.Sequential(
+            nn.Conv3d(in_channels, mid_channels, kernel_size=1, stride=1),
+            nn.BatchNorm3d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid_channels, mid_channels, kernel_size=kernel_sizes[1],
+                      stride=1, padding=kernel_sizes[1]//2),
+            nn.BatchNorm3d(mid_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        outA = self.pathA(x)
+        outB = self.pathB(x)
+        # Concatenate along channel dimension
+        out = torch.cat([outA, outB], dim=1)
+        return out
+
+
+class OvarXNet(nn.Module):
+    """
+    OvarXNet: A novel 3D CNN architecture for volumetric PET/CT feature extraction
+    """
+    def __init__(self, num_features=128):
+        super(OvarXNet, self).__init__()
+
+        # Block 1: Initial Convolution + Pool
+        self.conv1 = nn.Conv3d(1, 16, kernel_size=3, stride=1, padding=1)
+        self.bn1   = nn.BatchNorm3d(16)
+        self.relu  = nn.ReLU(inplace=True)
+        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)  # 128->64
+
+        # Block 2: Multi-scale
+        self.ms_block = MultiScaleBlock3D(in_channels=16, out_channels=32,
+                                          kernel_sizes=[3, 5])
+        self.se_block = SqueezeExcite3D(32)
+        self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)  # 64->32
+
+        # Block 3: Residual block
+        self.res_block = ResidualBlock3D(in_channels=32, out_channels=64, stride=1)
+        self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2)  # 32->16
+
+        # Block 4: Deep Convolution
+        self.conv2 = nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1)  # 16->8
+        self.bn2   = nn.BatchNorm3d(128)
+
+        # Global Average Pool
+        self.gap = nn.AdaptiveAvgPool3d(1)
+
+        # Fully Connected
+        self.fc1 = nn.Linear(128, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, num_features)
+        self.dropout = nn.Dropout(p=0.3)
+
+    def forward(self, x):
+        # x shape: (batch_size, 1, 128, 128, 128) for PET volumes
+
+        # Block 1
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.pool1(out)  # -> [batch, 16, 64, 64, 64]
+
+        # Block 2: Multi-scale + SE + Pool
+        out = self.ms_block(out)  # -> [batch, 32, 64, 64, 64]
+        out = self.se_block(out)  # Squeeze-and-Excite
+        out = self.pool2(out)     # -> [batch, 32, 32, 32, 32]
+
+        # Residual Block
+        out = self.res_block(out) # -> [batch, 64, 32, 32, 32]
+        out = self.pool3(out)     # -> [batch, 64, 16, 16, 16]
+
+        # Deep Convolution
+        out = self.conv2(out)     # -> [batch, 128, 8, 8, 8]
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        # Global Average Pool
+        out = self.gap(out)       # -> [batch, 128, 1, 1, 1]
+        out = out.view(out.size(0), -1)  # -> [batch, 128]
+
+        # Fully Connected Layers
+        out = self.fc1(out)       # -> [batch, 512]
+        out = F.relu(out)
+        out = self.dropout(out)
+
+        out = self.fc2(out)       # -> [batch, 256]
+        out = F.relu(out)
+        out = self.dropout(out)
+
+        out = self.fc3(out)       # -> [batch, num_features]
+
+        # out is the final feature vector (e.g., 128-D) for RNN integration
+        return out
+
+
+if __name__ == "__main__":
+    # Example usage
+    # Batch size of 2, single channel, 128^3 volume
+    dummy_input = torch.randn(2, 1, 128, 128, 128)
+    model = OvarXNet(num_features=128)
+    features = model(dummy_input)
+    print("Output feature shape:", features.shape)
+    # Expected: [2, 128]
+
+
+
+'''
+How to Integrate with RNN
+Once you have the final 128-dimensional feature vector (features) from OvarXNet, you can feed it into an RNN for longitudinal analysis. For instance, if each patient has 
+𝑇
+T time points (PET scans), you would stack the extracted features along a new time dimension and pass the resulting sequence (T, \text{batch_size}, 128) into a GRU or LSTM module.
+'''
+
+# Example: GRU integration for a single patient with T time points
+# Suppose we have a list of T feature vectors, each [1, 128]
+# We'll stack them to shape [T, 1, 128] and feed into RNN.
+
+import torch.nn as nn
+
+gru = nn.GRU(input_size=128, hidden_size=256, batch_first=False, bidirectional=True)
+
+# Suppose features_list is a list of T feature vectors from OvarXNet
+features_list = [torch.randn(1, 128) for _ in range(5)]  # T=5 scans
+features_seq = torch.stack(features_list, dim=0)  # shape [5, 1, 128]
+
+output, hn = gru(features_seq)
+# 'output' has shape [5, 1, 512] (because bidirectional=True => 2 * hidden_size)
+# 'hn' has shape [2, 1, 256] (2 for bidirection)
+
